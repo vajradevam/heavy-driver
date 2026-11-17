@@ -10,6 +10,8 @@ export const KIND_PATH = 1;
 export const KIND_RAIL = 2;
 export const KIND_RUNWAY = 3;
 
+export const CHUNKS = 4; // each tile's geometry is split into CHUNKS x CHUNKS blocks that are culled separately
+
 export const SEG_STRIDE = 6; // x1, z1, x2, z2, halfWidth, kind
 export const NAME_STRIDE = 5; // x1, z1, x2, z2, nameIndex
 export const TREE_STRIDE = 4; // x, z, scale, tint

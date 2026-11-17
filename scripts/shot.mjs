@@ -16,7 +16,7 @@ await page.waitForFunction(() => window.__game, { timeout: 30000 });
 await page.type('#lat', String(lat));
 await page.type('#lon', String(lon));
 await page.click('#coordForm button');
-const ready = () => page.waitForFunction(() => { const w = window.__game.world; return w.stats().tiles >= 9 && !w.pending; }, { timeout: 120000 }).catch(() => console.log('timeout waiting for tiles'));
+const ready = () => page.waitForFunction(() => { const w = window.__game.world; return w.stats().tiles >= 1 && !w.pending; }, { timeout: 120000 }).catch(() => console.log('timeout waiting for tiles'));
 await new Promise((r) => setTimeout(r, 500));
 await ready();
 const info = () => page.evaluate(() => {

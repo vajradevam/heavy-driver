@@ -46,6 +46,14 @@
           <input id="infill" type="checkbox" /> Fill unmapped streets with guessed buildings
         </label>
         <div class="row">
+          <select id="quality" title="Auto lowers the resolution, then the detail, to keep the game smooth on this machine">
+            <option value="auto">Graphics: auto (adapts to this machine)</option>
+            <option value="low">Graphics: low (slow machines)</option>
+            <option value="medium">Graphics: medium</option>
+            <option value="high">Graphics: high</option>
+          </select>
+        </div>
+        <div class="row">
           <select id="timeMode" title="Day and night follow the real sun at the place you are driving">
             <option value="real">Time of day: real, for this place</option>
             <option value="day">Time of day: always day</option>

@@ -15,13 +15,13 @@ const open = async (browser, query) => {
 };
 const b1 = await launch(), b2 = await launch();
 const p1 = await open(b1, '?lat=48.8738&lon=2.295');
-await p1.waitForFunction(() => window.__game?.world.stats().tiles >= 9, { timeout: 90000 });
+await p1.waitForFunction(() => window.__game?.world.stats().tiles >= 1 && !window.__game.world.pending, { timeout: 90000 });
 const p2 = await open(b2, '?lat=40.758&lon=-73.9855'); // starts in New York, should jump to player 1
 const t0 = Date.now();
 const ok = await p2.waitForFunction(() => window.__game?.net.peers.size > 0, { timeout: 60000 }).then(() => true, () => false);
 console.log('peer connected:', ok, 'after', Date.now() - t0, 'ms');
 if (ok) {
-  await p2.waitForFunction(() => window.__game.world.stats().tiles >= 9 && !window.__game.world.pending, { timeout: 90000 }).catch(() => {});
+  await p2.waitForFunction(() => window.__game.world.stats().tiles >= 1 && !window.__game.world.pending, { timeout: 90000 }).catch(() => {});
   await new Promise((r) => setTimeout(r, 3000));
   await p1.bringToFront();
   const view = (p) => p.evaluate(() => {

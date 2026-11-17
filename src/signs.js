@@ -78,28 +78,38 @@ export class Signs {
     this.active = new Map(); // label key -> board
     this.idle = [];
     this.materials = [];
-    const poleGeo = new THREE.CylinderGeometry(0.06, 0.06, 1, 6).translate(0, 0.5, 0);
-    const poleMat = new THREE.MeshLambertMaterial({ color: 0x70757c });
-    const plateGeo = new THREE.PlaneGeometry(1, 1);
+    this.limit = POOL;
+    this.rangeScale = 1;
+    // front and back faces in one geometry, so a board is a single draw call
+    const plateGeo = new THREE.BufferGeometry();
+    plateGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+      -0.5, -0.5, 0.03, 0.5, -0.5, 0.03, 0.5, 0.5, 0.03, -0.5, 0.5, 0.03,
+      0.5, -0.5, -0.03, -0.5, -0.5, -0.03, -0.5, 0.5, -0.03, 0.5, 0.5, -0.03,
+    ]), 3));
+    plateGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array([0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1]), 2));
+    plateGeo.setIndex([0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+    // every pole in one instanced mesh
+    this.poles = new THREE.InstancedMesh(
+      new THREE.CylinderGeometry(0.06, 0.06, 1, 5).translate(0, 0.5, 0),
+      new THREE.MeshLambertMaterial({ color: 0x70757c }), POOL,
+    );
+    this.poles.frustumCulled = false;
+    this.hidden = new THREE.Matrix4().makeScale(0, 0, 0);
+    this.tmp = new THREE.Matrix4();
+    for (let i = 0; i < POOL; i++) this.poles.setMatrixAt(i, this.hidden);
+    scene.add(this.poles);
     for (let i = 0; i < POOL; i++) {
       const canvas = document.createElement('canvas');
       canvas.width = 256; canvas.height = 64;
       const tex = new THREE.CanvasTexture(canvas);
       tex.colorSpace = THREE.SRGBColorSpace;
-      tex.anisotropy = 4;
+      tex.anisotropy = 2;
       const mat = new THREE.MeshBasicMaterial({ map: tex });
       this.materials.push(mat);
-      const group = new THREE.Group();
-      const pole = new THREE.Mesh(poleGeo, poleMat);
-      const front = new THREE.Mesh(plateGeo, mat), back = new THREE.Mesh(plateGeo, mat);
-      back.rotation.y = Math.PI;
-      front.position.z = 0.03; back.position.z = -0.03;
-      const plate = new THREE.Group();
-      plate.add(front, back);
-      group.add(pole, plate);
-      group.visible = false;
-      scene.add(group);
-      this.idle.push({ group, pole, plate, tex, g: canvas.getContext('2d'), key: '' });
+      const plate = new THREE.Mesh(plateGeo, mat);
+      plate.visible = false;
+      scene.add(plate);
+      this.idle.push({ plate, tex, g: canvas.getContext('2d'), i, label: null, lift: 0 });
     }
   }
 
@@ -107,6 +117,13 @@ export class Signs {
   setNight(night) {
     const v = 1 - night * 0.5;
     for (const m of this.materials) m.color.setRGB(v, v, v);
+  }
+
+  // How many boards may be shown at once, and a multiplier on how far away they appear.
+  setLimits(limit, rangeScale) {
+    this.limit = Math.min(POOL, limit);
+    this.rangeScale = rangeScale;
+    this.timer = 1;
   }
 
   update(dt, x, z) {
@@ -120,15 +137,16 @@ export class Signs {
       for (let i = 0; i < labels.length; i++) {
         const l = labels[i];
         const d = Math.hypot(t.wx + l.x - x, t.wz + l.z - z);
-        if (d < RANGE[l.k]) found.push([l.k === 2 ? d / 3 : d, t, i]);
+        if (d < RANGE[l.k] * this.rangeScale) found.push([l.k === 2 ? d / 3 : d, t, i]);
       }
     }
     found.sort((a, b) => a[0] - b[0]);
-    found.length = Math.min(found.length, POOL);
+    found.length = Math.min(found.length, this.limit);
     const keep = new Set(found.map(([, t, i]) => `${t.key}:${i}`));
     for (const [key, b] of this.active) {
       if (keep.has(key)) continue;
-      b.group.visible = false;
+      b.plate.visible = false;
+      this.poles.setMatrixAt(b.i, this.hidden);
       this.active.delete(key);
       this.idle.push(b);
     }
@@ -140,16 +158,18 @@ export class Signs {
         if (!b) break;
         draw(b.g, l);
         b.tex.needsUpdate = true;
-        const [w, h, y] = SIZE[l.k];
-        const lift = l.k === 1 ? ((i * 37) % 10) * 0.07 : 0;
-        b.plate.scale.set(w, h, 1);
-        b.plate.position.y = y + lift;
-        b.pole.scale.set(l.k === 2 ? 2.2 : 1, y + lift, l.k === 2 ? 2.2 : 1);
-        b.group.rotation.y = l.a;
-        b.group.visible = true;
+        b.label = l;
+        b.lift = l.k === 1 ? ((i * 37) % 10) * 0.07 : 0;
+        b.plate.scale.set(SIZE[l.k][0], SIZE[l.k][1], 1);
+        b.plate.rotation.y = l.a;
+        b.plate.visible = true;
         this.active.set(key, b);
       }
-      b.group.position.set(t.wx + l.x, 0, t.wz + l.z); // re-applied every pass so origin shifts are harmless
+      // positions are re-applied every pass so origin shifts are harmless
+      const wx = t.wx + l.x, wz = t.wz + l.z, y = SIZE[l.k][2] + b.lift, thick = l.k === 2 ? 2.2 : 1;
+      b.plate.position.set(wx, y, wz);
+      this.poles.setMatrixAt(b.i, this.tmp.makeScale(thick, y, thick).setPosition(wx, 0, wz));
     }
+    this.poles.instanceMatrix.needsUpdate = true;
   }
 }

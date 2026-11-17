@@ -7,7 +7,7 @@ import { PbfReader } from 'pbf';
 import earcut from 'earcut';
 import {
   CELL, PAD, KIND_ROAD, KIND_PATH, KIND_RAIL, KIND_RUNWAY,
-  SEG_STRIDE, NAME_STRIDE, TREE_STRIDE,
+  SEG_STRIDE, NAME_STRIDE, TREE_STRIDE, CHUNKS,
 } from './shared.js';
 
 const E = 4096; // tile extent in tile units
@@ -47,34 +47,93 @@ const srgb = (c) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.
 const hex = (h) => [srgb(((h >> 16) & 255) / 255), srgb(((h >> 8) & 255) / 255), srgb((h & 255) / 255)];
 const shade = (c, f) => [c[0] * f, c[1] * f, c[2] * f];
 
+// Reorder triangles so each chunk's triangles are contiguous (order inside a chunk is kept).
+// Returns the sorted index buffer, a [start, count] index range per chunk and a bounding box per chunk.
+function chunkSort(pos, idx, tm) {
+  const NCH = CHUNKS * CHUNKS, size = tm / CHUNKS, nt = idx.length / 3;
+  const ck = new Uint8Array(nt), start = new Uint32Array(NCH + 1);
+  const bounds = new Float32Array(NCH * 6);
+  for (let c = 0; c < NCH; c++) { bounds.fill(Infinity, c * 6, c * 6 + 3); bounds.fill(-Infinity, c * 6 + 3, c * 6 + 6); }
+  const cell = (v) => Math.min(CHUNKS - 1, Math.max(0, Math.floor(v / size)));
+  for (let t = 0; t < nt; t++) {
+    const a = idx[t * 3] * 3, b = idx[t * 3 + 1] * 3, d = idx[t * 3 + 2] * 3;
+    const c = cell((pos[a + 2] + pos[b + 2] + pos[d + 2]) / 3) * CHUNKS + cell((pos[a] + pos[b] + pos[d]) / 3);
+    ck[t] = c;
+    start[c + 1]++;
+    const o = c * 6;
+    for (const v of [a, b, d]) {
+      for (let j = 0; j < 3; j++) {
+        if (pos[v + j] < bounds[o + j]) bounds[o + j] = pos[v + j];
+        if (pos[v + j] > bounds[o + 3 + j]) bounds[o + 3 + j] = pos[v + j];
+      }
+    }
+  }
+  for (let c = 0; c < NCH; c++) start[c + 1] += start[c];
+  const fill = start.slice(0, NCH), index = new Uint32Array(idx.length), ranges = new Uint32Array(NCH * 2);
+  for (let t = 0; t < nt; t++) {
+    const o = fill[ck[t]]++ * 3;
+    index[o] = idx[t * 3]; index[o + 1] = idx[t * 3 + 1]; index[o + 2] = idx[t * 3 + 2];
+  }
+  for (let c = 0; c < NCH; c++) { ranges[c * 2] = start[c] * 3; ranges[c * 2 + 1] = (start[c + 1] - start[c]) * 3; }
+  return { index, ranges, bounds };
+}
+
 class Flat {
   constructor() { this.p = []; this.c = []; this.i = []; this.n = 0; }
   v(x, y, z, col) { this.p.push(x, y, z); this.c.push(col[0], col[1], col[2]); return this.n++; }
   tri(a, b, c) { this.i.push(a, b, c); }
-  out(transfer) {
-    const o = {
-      position: new Float32Array(this.p),
-      color: new Float32Array(this.c),
-      index: new Uint32Array(this.i),
-    };
+  // tm given => split into chunks; otherwise one mesh in emission order
+  out(transfer, tm) {
+    const o = { position: new Float32Array(this.p), color: new Float32Array(this.c), index: new Uint32Array(this.i) };
+    if (tm) Object.assign(o, chunkSort(o.position, o.index, tm));
     transfer.push(o.position.buffer, o.color.buffer, o.index.buffer);
+    if (tm) transfer.push(o.ranges.buffer, o.bounds.buffer);
     return o;
   }
 }
 
+// Buildings: walls and roofs of every facade style in one buffer. `layer` picks the facade
+// texture (a layer of a texture array) per vertex, so a whole chunk of city is one draw call.
 class Walls {
-  constructor() { this.p = []; this.nrm = []; this.uv = []; this.c = []; this.i = []; this.n = 0; }
-  out(transfer) {
+  constructor() { this.p = []; this.nrm = []; this.uv = []; this.c = []; this.l = []; this.i = []; this.n = 0; }
+  out(transfer, tm) {
     const o = {
       position: new Float32Array(this.p),
       normal: new Float32Array(this.nrm),
       uv: new Float32Array(this.uv),
       color: new Float32Array(this.c),
+      layer: new Float32Array(this.l),
       index: new Uint32Array(this.i),
     };
-    transfer.push(o.position.buffer, o.normal.buffer, o.uv.buffer, o.color.buffer, o.index.buffer);
+    Object.assign(o, chunkSort(o.position, o.index, tm));
+    transfer.push(o.position.buffer, o.normal.buffer, o.uv.buffer, o.color.buffer, o.layer.buffer, o.index.buffer, o.ranges.buffer, o.bounds.buffer);
     return o;
   }
+}
+
+// Instance matrices + colours for trees / bushes, grouped by chunk (order inside a chunk is kept,
+// so drawing only the first part of a chunk thins it evenly, roadside plants first).
+function instances(list, tm, size, stretch0, stretch1, hue, sat, light) {
+  const n = list.length / TREE_STRIDE, NCH = CHUNKS * CHUNKS, cs = tm / CHUNKS;
+  const cell = (v) => Math.min(CHUNKS - 1, Math.max(0, Math.floor(v / cs)));
+  const ck = new Uint8Array(n), start = new Uint32Array(NCH + 1);
+  for (let i = 0; i < n; i++) { ck[i] = cell(list[i * TREE_STRIDE + 1]) * CHUNKS + cell(list[i * TREE_STRIDE]); start[ck[i] + 1]++; }
+  for (let c = 0; c < NCH; c++) start[c + 1] += start[c];
+  const fill = start.slice(0, NCH), matrix = new Float32Array(n * 16), color = new Float32Array(n * 3), ranges = new Uint32Array(NCH * 2);
+  const hue2rgb = (p, q, t) => { t = (t + 1) % 1; return t < 1 / 6 ? p + (q - p) * 6 * t : t < 1 / 2 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p; };
+  for (let i = 0; i < n; i++) {
+    const o = i * TREE_STRIDE, x = list[o], z = list[o + 1], tint = list[o + 3];
+    const sc = list[o + 2] * size, sy = sc * (stretch0 + tint * stretch1);
+    const a = tint * 6.283, cos = Math.cos(a) * sc, sin = Math.sin(a) * sc;
+    const k = fill[ck[i]]++, m = k * 16;
+    matrix[m] = cos; matrix[m + 2] = -sin; matrix[m + 5] = sy; matrix[m + 8] = sin; matrix[m + 10] = cos;
+    matrix[m + 12] = x; matrix[m + 14] = z; matrix[m + 15] = 1;
+    const h = hue + tint * 0.1, s2 = sat + tint * 0.2, l = light + tint * (light > 0.25 ? 0.12 : 0.1);
+    const q = l < 0.5 ? l * (1 + s2) : l + s2 - l * s2, p2 = 2 * l - q;
+    color[k * 3] = srgb(hue2rgb(p2, q, h + 1 / 3)); color[k * 3 + 1] = srgb(hue2rgb(p2, q, h)); color[k * 3 + 2] = srgb(hue2rgb(p2, q, h - 1 / 3));
+  }
+  for (let c = 0; c < NCH; c++) { ranges[c * 2] = start[c]; ranges[c * 2 + 1] = start[c + 1] - start[c]; }
+  return { matrix, color, ranges };
 }
 
 function ringArea(pts) {
@@ -257,7 +316,7 @@ function offsetLine(pts, off) {
 
 function disc(acc, x, z, r, y, col) {
   const c = acc.v(x, y, z, col);
-  const S = 10;
+  const S = 8;
   let prev = acc.v(x + r, y, z, col);
   for (let i = 1; i <= S; i++) {
     const a = (i / S) * Math.PI * 2;
@@ -292,7 +351,7 @@ function dashes(acc, pts, hw, y, col, on, off) {
 }
 
 // Extrude one ring into walls. Rings must be normalised: outer area > 0, holes < 0.
-function wallRing(w, ring, y0, y1, col, v0, v1) {
+function wallRing(w, ring, y0, y1, col, v0, v1, layer) {
   let u = 0;
   for (let i = 0, n = ring.length; i < n; i++) {
     const a = ring[i], b = ring[(i + 1) % n];
@@ -306,24 +365,49 @@ function wallRing(w, ring, y0, y1, col, v0, v1) {
     // order: b-bottom, a-bottom, a-top, b-top  => front face points along (nx, nz)
     w.p.push(b[0], y0, b[1], a[0], y0, a[1], a[0], y1, a[1], b[0], y1, b[1]);
     w.uv.push(u1, v0, u0, v0, u0, v1, u1, v1);
-    for (let j = 0; j < 4; j++) { w.nrm.push(nx, 0, nz); w.c.push(col[0], col[1], col[2]); }
+    for (let j = 0; j < 4; j++) { w.nrm.push(nx, 0, nz); w.c.push(col[0], col[1], col[2]); w.l.push(layer); }
     w.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
     w.n += 4;
   }
 }
 
-// Baked sunlight for roof faces (roofs use an unlit material).
-const SUN = (() => { const l = Math.hypot(-0.5, 1, 0.35); return [-0.5 / l, 1 / l, 0.35 / l]; })();
-function litFace(acc, pts, col) {
+// One planar roof face (3D points) added to the building buffer, facing upwards.
+function roofFace(w, pts, col) {
   const [a, b, c] = pts;
   const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
   let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
   const l = Math.hypot(nx, ny, nz) || 1;
-  if (ny < 0) { nx = -nx; ny = -ny; nz = -nz; }
-  const lit = shade(col, 0.55 + 0.5 * Math.max(0, (nx * SUN[0] + ny * SUN[1] + nz * SUN[2]) / l));
-  const base = acc.n;
-  for (const p of pts) acc.v(p[0], p[1], p[2], lit);
-  for (let i = 1; i + 1 < pts.length; i++) acc.tri(base, base + i, base + i + 1);
+  const flip = ny < 0;
+  if (flip) { nx = -nx; ny = -ny; nz = -nz; }
+  const base = w.n;
+  for (const p of pts) {
+    w.p.push(p[0], p[1], p[2]); w.nrm.push(nx / l, ny / l, nz / l); w.uv.push(0, 0); w.c.push(col[0], col[1], col[2]); w.l.push(S_ROOF);
+  }
+  w.n += pts.length;
+  for (let i = 1; i + 1 < pts.length; i++) {
+    if (flip) w.i.push(base, base + i + 1, base + i); else w.i.push(base, base + i, base + i + 1);
+  }
+}
+
+// Flat roof: the footprint triangulated at height y.
+function flatRoof(w, poly, y, col) {
+  const flat = [], holes = [];
+  for (const p of poly.outer) flat.push(p[0], p[1]);
+  for (const h of poly.holes) { holes.push(flat.length / 2); for (const p of h) flat.push(p[0], p[1]); }
+  const tris = earcut(flat, holes.length ? holes : undefined, 2);
+  if (!tris.length) return;
+  const base = w.n;
+  for (let i = 0; i < flat.length; i += 2) {
+    w.p.push(flat[i], y, flat[i + 1]); w.nrm.push(0, 1, 0); w.uv.push(0, 0); w.c.push(col[0], col[1], col[2]); w.l.push(S_ROOF);
+  }
+  w.n += flat.length / 2;
+  for (let i = 0; i < tris.length; i += 3) {
+    const a = tris[i] * 2, b = tris[i + 1] * 2, c = tris[i + 2] * 2;
+    // keep the face pointing up
+    const up = (flat[b + 1] - flat[a + 1]) * (flat[c] - flat[a]) - (flat[b] - flat[a]) * (flat[c + 1] - flat[a + 1]) > 0;
+    if (up) w.i.push(base + tris[i], base + tris[i + 1], base + tris[i + 2]);
+    else w.i.push(base + tris[i], base + tris[i + 2], base + tris[i + 1]);
+  }
 }
 
 // Gable / hip roof over a 4-corner footprint. hip = 0 gives a gable, up to ~0.8 a hip roof.
@@ -339,16 +423,16 @@ function pitchedRoof(acc, ring, y, col, hip) {
   const B2 = [B[0] + (A[0] - B[0]) * inset, B[1] + (A[1] - B[1]) * inset];
   A = A2; B = B2;
   const P = (p, h) => [p[0], y + h, p[1]];
-  litFace(acc, [P(q[0], 0), P(q[1], 0), P(B, rise), P(A, rise)], col);
-  litFace(acc, [P(q[2], 0), P(q[3], 0), P(A, rise), P(B, rise)], col);
-  litFace(acc, [P(q[1], 0), P(q[2], 0), P(B, rise)], col);
-  litFace(acc, [P(q[3], 0), P(q[0], 0), P(A, rise)], col);
+  roofFace(acc, [P(q[0], 0), P(q[1], 0), P(B, rise), P(A, rise)], col);
+  roofFace(acc, [P(q[2], 0), P(q[3], 0), P(A, rise), P(B, rise)], col);
+  roofFace(acc, [P(q[1], 0), P(q[2], 0), P(B, rise)], col);
+  roofFace(acc, [P(q[3], 0), P(q[0], 0), P(A, rise)], col);
 }
 
 // ---------------------------------------------------------------- styling
 
 // Facade styles: one wall mesh (and texture) per style. Keep in sync with world.js.
-const S_PLASTER = 0, S_GLASS = 1, S_BRICK = 2, S_BALCONY = 3, S_STRIP = 4, S_INDUSTRIAL = 5, S_SHOP = 6, STYLES = 7;
+const S_PLASTER = 0, S_GLASS = 1, S_BRICK = 2, S_BALCONY = 3, S_STRIP = 4, S_INDUSTRIAL = 5, S_SHOP = 6, S_ROOF = 7; // S_ROOF = plain surface
 
 // Road classes. Lanes are [two-way, one-way]; total width = lanes * lane width + 2 * shoulder.
 // The tiles carry no lane counts, so these are typical values per class.
@@ -430,8 +514,9 @@ function build(tile, job) {
   const k = tm / E;
   const rng = mulberry32((job.tx * 73856093) ^ (job.ty * 19349663));
   const transfer = [];
-  const land = new Flat(), road = new Flat(), roofs = new Flat();
-  const wallsBy = Array.from({ length: STYLES }, () => new Walls());
+  const land = new Flat(), bld = new Walls();
+  // roads are drawn in four ordered passes: sidewalks, small roads, big roads, paint
+  const casing = new Flat(), minorRoads = new Flat(), majorRoads = new Flat(), marks = new Flat();
   const L = (name) => (tile && tile.layers[name]) || null;
   const each = (name, fn) => {
     const layer = L(name);
@@ -553,8 +638,9 @@ function build(tile, job) {
   });
   roads.sort((a, b) => a.rank - b.rank);
 
-  for (const r of roads) if (r.walk) ribbon(road, r.pts, r.hw + 1.6, 0, COL.sidewalk);
+  for (const r of roads) if (r.walk) ribbon(casing, r.pts, r.hw + 1.6, 0, COL.sidewalk);
   for (const r of roads) {
+    const road = r.rank >= 5 ? majorRoads : minorRoads;
     ribbon(road, r.pts, r.hw, 0, r.col);
     const a = r.pts[0], b = r.pts[r.pts.length - 1];
     const onEdge = (p) => p[0] < 0.01 || p[1] < 0.01 || p[0] > tm - 0.01 || p[1] > tm - 0.01;
@@ -562,22 +648,22 @@ function build(tile, job) {
     if (!onEdge(b)) disc(road, b[0], b[1], r.hw, 0, r.col);
   }
   for (const r of roads) {
-    if (r.runway) dashes(road, r.pts, 0.45, 0, COL.mark, 30, 20);
+    if (r.runway) dashes(marks, r.pts, 0.45, 0, COL.mark, 30, 20);
     if (!r.lanes) continue;
     const half = (r.lanes * r.lw) / 2;
     if (r.edge) {
-      ribbon(road, offsetLine(r.pts, half), 0.1, 0, COL.mark);
-      ribbon(road, offsetLine(r.pts, -half), 0.1, 0, COL.mark);
+      ribbon(marks, offsetLine(r.pts, half), 0.1, 0, COL.mark);
+      ribbon(marks, offsetLine(r.pts, -half), 0.1, 0, COL.mark);
     }
     for (let i = 1; i < r.lanes; i++) {
       const off = -half + i * r.lw;
       if (!r.oneway && i * 2 === r.lanes) {
         // centre line: double solid yellow on wide roads, dashed on two-lane roads
         if (r.lanes >= 4) {
-          ribbon(road, offsetLine(r.pts, 0.16), 0.07, 0, COL.centre);
-          ribbon(road, offsetLine(r.pts, -0.16), 0.07, 0, COL.centre);
-        } else dashes(road, r.pts, 0.08, 0, COL.mark, 3, 4.5);
-      } else dashes(road, offsetLine(r.pts, off), 0.07, 0, COL.mark, 3, 9);
+          ribbon(marks, offsetLine(r.pts, 0.16), 0.07, 0, COL.centre);
+          ribbon(marks, offsetLine(r.pts, -0.16), 0.07, 0, COL.centre);
+        } else dashes(marks, r.pts, 0.08, 0, COL.mark, 3, 4.5);
+      } else dashes(marks, offsetLine(r.pts, off), 0.07, 0, COL.mark, 3, 9);
     }
   }
 
@@ -633,13 +719,13 @@ function build(tile, job) {
     const rings = [poly.outer, ...poly.holes];
     let yb = y0;
     if (o.shop && y0 === 0 && y1 >= 6.4) {
-      for (const r of rings) wallRing(wallsBy[S_SHOP], r, 0, 3.4, o.wallCol, 0, 1);
+      for (const r of rings) wallRing(bld, r, 0, 3.4, o.wallCol, 0, 1, S_SHOP);
       yb = 3.4;
     }
     const floors = Math.max(1, Math.round((y1 - yb) / 3.1));
-    for (const r of rings) wallRing(wallsBy[o.style], r, yb, y1, o.wallCol, 0, floors);
-    if (o.pitched >= 0 && poly.outer.length === 4 && !poly.holes.length) pitchedRoof(roofs, poly.outer, y1, o.roofCol, o.pitched);
-    else flatPolygon(roofs, poly, y1, o.roofCol);
+    for (const r of rings) wallRing(bld, r, yb, y1, o.wallCol, 0, floors, o.style);
+    if (o.pitched >= 0 && poly.outer.length === 4 && !poly.holes.length) pitchedRoof(bld, poly.outer, y1, o.roofCol, o.pitched);
+    else flatRoof(bld, poly, y1, o.roofCol);
     if (y0 < 2.5) blds.push({ ring: poly.outer, bbox: poly.bbox });
     if (o.box) {
       const cx = (poly.bbox[0] + poly.bbox[2]) / 2, cz = (poly.bbox[1] + poly.bbox[3]) / 2, e = 1.2 + o.box * 1.4;
@@ -899,15 +985,17 @@ function build(tile, job) {
   });
   const pick = (list, budget) => {
     const count = list.length / TREE_STRIDE;
+    if (budget <= 0) return [];
     if (count <= budget) return list;
     const out = [], keep = budget / count;
     for (let i = 0; i < list.length; i += TREE_STRIDE) if (rng() < keep) out.push(list[i], list[i + 1], list[i + 2], list[i + 3]);
     return out;
   };
-  const bushPicked = pick(bushNear, MAX_BUSHES - 1000);
-  const bushes = bushPicked.concat(pick(bushFar, MAX_BUSHES - bushPicked.length / TREE_STRIDE));
-  const nearPicked = pick(near, MAX_TREES - 2500);
-  const trees = nearPicked.concat(pick(far, MAX_TREES - nearPicked.length / TREE_STRIDE));
+  const treeBudget = job.treeBudget ?? MAX_TREES, bushBudget = job.bushBudget ?? MAX_BUSHES;
+  const bushPicked = pick(bushNear, bushBudget * 0.8);
+  const bushes = bushPicked.concat(pick(bushFar, bushBudget - bushPicked.length / TREE_STRIDE));
+  const nearPicked = pick(near, treeBudget * 0.8);
+  const trees = nearPicked.concat(pick(far, treeBudget - nearPicked.length / TREE_STRIDE));
 
   // --- street names
   const names = [];
@@ -1049,22 +1137,25 @@ function build(tile, job) {
     roadside(x, z, 6.5, 2.4, t, 1, cls);
   }
 
-  const treeArr = new Float32Array(trees);
-  const bushArr = new Float32Array(bushes);
+  const treeInst = instances(trees, tm, 4.2, 0.85, 0.4, 0.26, 0.45, 0.3);
+  const bushInst = instances(bushes, tm, 1.9, 0.8, 0.5, 0.24, 0.4, 0.22);
   const grid = (g) => { transfer.push(g.start.buffer, g.items.buffer); return { N: g.N, start: g.start, items: g.items }; };
-  transfer.push(segs.buffer, bldPts.buffer, bldOff.buffer, bldBox.buffer, nameSegs.buffer, treeArr.buffer, bushArr.buffer);
+  transfer.push(segs.buffer, bldPts.buffer, bldOff.buffer, bldBox.buffer, nameSegs.buffer,
+    treeInst.matrix.buffer, treeInst.color.buffer, treeInst.ranges.buffer, bushInst.matrix.buffer, bushInst.color.buffer, bushInst.ranges.buffer);
   const data = {
     land: land.out(transfer),
-    roads: road.out(transfer),
-    walls: wallsBy.map((w) => w.out(transfer)),
-    roofs: roofs.out(transfer),
-    trees: treeArr,
-    bushes: bushArr,
+    casing: casing.out(transfer, tm),
+    minorRoads: minorRoads.out(transfer, tm),
+    majorRoads: majorRoads.out(transfer, tm),
+    marks: marks.out(transfer, tm),
+    buildings: bld.out(transfer, tm),
+    trees: treeInst,
+    bushes: bushInst,
     labels,
     segs, segGrid: grid(segGrid),
     bldPts, bldOff, bldBox, bldGrid: grid(bldGrid),
     names, nameSegs, nameGrid: grid(nameGrid),
-    stats: { mapped, guessed, trees: treeArr.length / TREE_STRIDE, bushes: bushArr.length / TREE_STRIDE, labels: labels.length, segs: segCount, empty: !tile },
+    stats: { mapped, guessed, trees: trees.length / TREE_STRIDE, bushes: bushes.length / TREE_STRIDE, labels: labels.length, segs: segCount, empty: !tile },
   };
   return { data, transfer };
 }

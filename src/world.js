@@ -4,14 +4,14 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
   Z, EARTH, CELL, PAD, KIND_ROAD, KIND_PATH, KIND_RAIL,
-  SEG_STRIDE, NAME_STRIDE, TREE_STRIDE, lonLatToMerc, mercToLonLat,
+  SEG_STRIDE, NAME_STRIDE, CHUNKS, lonLatToMerc, mercToLonLat,
 } from './shared.js';
 
 const TILEJSON = 'https://tiles.openfreemap.org/planet';
 const N_TILES = 2 ** Z;
-const LOAD_RING = 1; // load a (2*1+1)² block around the player
-const KEEP_RING = 2; // drop tiles outside this ring
-const WORKERS = 3;
+const KEEP_MARGIN = 500; // tiles are dropped this far beyond the view distance, metres
+// leave a core for the game itself on small machines
+const WORKERS = Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 4) - 1));
 
 // Facade textures, one per building style (order matches the S_* constants in tileWorker.js).
 // Each texture is one 3 m wide x one-storey bay; it is multiplied by the building's wall colour.
@@ -23,10 +23,6 @@ function facadeTextures() {
     g.fillStyle = '#fff';
     g.fillRect(0, 0, 128, 128);
     paint(g);
-    const t = new THREE.CanvasTexture(c);
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.colorSpace = THREE.SRGBColorSpace;
-    t.anisotropy = 4;
     // Night glow: the same window openings over a 4 x 4 block of bays, each lit or dark at random.
     const e = document.createElement('canvas');
     e.width = e.height = 256;
@@ -42,12 +38,8 @@ function facadeTextures() {
       eg.globalAlpha = 0.55 + (r % 5) * 0.1;
       for (const [x, y, w, h] of rects) eg.fillRect(bx * 64 + x / 2, by * 64 + y / 2, w / 2, h / 2);
     }
-    const glow = new THREE.CanvasTexture(e);
-    glow.wrapS = glow.wrapT = THREE.RepeatWrapping;
-    glow.colorSpace = THREE.SRGBColorSpace;
-    glow.repeat.set(0.25, 0.25);
     rects = [];
-    return { map: t, glow };
+    return { map: c, glow: e };
   };
   let rects = [];
   const glass = (g, x, y, w, h) => {
@@ -63,7 +55,7 @@ function facadeTextures() {
     g.fillStyle = '#f6f6f6'; g.fillRect(x + w / 2 - 1.5, y, 3, h);
     g.fillStyle = '#c9c9c9'; g.fillRect(x - 7, y + h + 4, w + 14, 5);
   };
-  return [
+  const styles = [
     // 0 plaster with a framed window
     make((g) => { g.fillStyle = '#e6e6e6'; g.fillRect(0, 0, 128, 5); win(g, 36, 34, 56, 58); }),
     // 1 glass curtain wall
@@ -120,7 +112,52 @@ function facadeTextures() {
       glass(g, 90, 46, 28, 60);
       g.fillStyle = '#d9d9d9'; g.fillRect(80, 38, 4, 90);
     }),
+    // 7 plain surface (roofs): white, no glow
+    make(() => {}),
   ];
+  // Pack the canvases into texture arrays (one layer per style) so all buildings share one material.
+  const pack = (canvases, size) => {
+    const data = new Uint8Array(size * size * 4 * canvases.length);
+    canvases.forEach((cv, layer) => {
+      const px = cv.getContext('2d').getImageData(0, 0, size, size).data, row = size * 4;
+      for (let y = 0; y < size; y++) data.set(px.subarray(y * row, (y + 1) * row), layer * size * row + (size - 1 - y) * row); // flip rows: v = 0 is the bottom
+    });
+    const t = new THREE.DataArrayTexture(data, size, size, canvases.length);
+    t.format = THREE.RGBAFormat;
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.magFilter = THREE.LinearFilter;
+    t.minFilter = THREE.LinearMipmapLinearFilter;
+    t.generateMipmaps = true;
+    t.anisotropy = 4;
+    t.needsUpdate = true;
+    return t;
+  };
+  return { facades: pack(styles.map((st) => st.map), 128), glows: pack(styles.map((st) => st.glow), 256) };
+}
+
+// One lit material for every building: the stock Lambert shader with its two texture lookups
+// redirected to the facade / glow texture arrays, indexed by the per-vertex `layer` attribute.
+function buildingMaterial() {
+  const { facades, glows } = facadeTextures();
+  const dummy = (repeat) => {
+    const t = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+    t.repeat.set(repeat, repeat);
+    t.needsUpdate = true;
+    return t;
+  };
+  // the dummy maps switch on the shader's uv plumbing; the glow one also carries the 4-bay repeat
+  const m = new THREE.MeshLambertMaterial({ vertexColors: true, map: dummy(1), emissive: 0xffffff, emissiveMap: dummy(0.25), emissiveIntensity: 0 });
+  m.onBeforeCompile = (shader) => {
+    shader.uniforms.facades = { value: facades };
+    shader.uniforms.glows = { value: glows };
+    shader.vertexShader = 'attribute float layer;\nvarying float vLayer;\n' + shader.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n  vLayer = layer;');
+    shader.fragmentShader = 'uniform highp sampler2DArray facades;\nuniform highp sampler2DArray glows;\nvarying float vLayer;\n' + shader.fragmentShader
+      .replace('#include <map_fragment>', 'diffuseColor *= texture( facades, vec3( vMapUv, floor( vLayer + 0.5 ) ) );')
+      .replace('#include <emissivemap_fragment>', 'totalEmissiveRadiance *= texture( glows, vec3( vEmissiveMapUv, floor( vLayer + 0.5 ) ) ).rgb;');
+  };
+  m.customProgramCacheKey = () => 'buildings';
+  return m;
 }
 
 export class World {
@@ -137,13 +174,15 @@ export class World {
     this.jobId = 0;
     this.stamp = 1;
     this.lastError = '';
+    this.cullTimer = 99;
+    // view = how far the world is drawn; the other distances cull detail inside that (all metres)
+    this.q = { view: 2300, marks: 1300, trees: 2300, treeDensity: 1, treeBudget: 12000, bushBudget: 5000 };
 
     const flat = { vertexColors: true, side: THREE.DoubleSide, depthTest: false, depthWrite: false };
     this.mat = {
       land: new THREE.MeshBasicMaterial(flat),
       roads: new THREE.MeshBasicMaterial(flat),
-      walls: facadeTextures().map(({ map, glow }) => new THREE.MeshLambertMaterial({ vertexColors: true, map, emissive: 0xffffff, emissiveMap: glow, emissiveIntensity: 0 })),
-      roofs: new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }),
+      buildings: buildingMaterial(),
       tree: new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true }),
     };
     // One low-poly tree (trunk + canopy) about 1 unit wide; instances scale it up.
@@ -223,33 +262,72 @@ export class World {
     return n;
   }
 
-  update(x, z) {
+  // Detail settings. Changing the plant budgets regenerates the tiles; the rest applies at once.
+  setQuality(q) {
+    const regen = q.treeBudget !== this.q.treeBudget || q.bushBudget !== this.q.bushBudget;
+    this.q = q;
+    this.cullTimer = 99;
+    if (regen) this.clear();
+  }
+
+  update(x, z, dt = 0) {
     if (!this.urlTemplate) return;
-    const { ox, oy, S } = this.origin;
-    const ptx = Math.floor((ox + x / S) * N_TILES), pty = Math.floor((oy + z / S) * N_TILES);
+    const { ox, oy, S } = this.origin, tm = this.tileMeters, view = this.q.view;
+    const fx = (ox + x / S) * N_TILES, fy = (oy + z / S) * N_TILES;
+    const ptx = Math.floor(fx), pty = Math.floor(fy);
     this.center = [ptx, pty];
-    for (let dy = -LOAD_RING; dy <= LOAD_RING; dy++) {
-      for (let dx = -LOAD_RING; dx <= LOAD_RING; dx++) {
+    // distance in metres from the player to a tile's square
+    const dist = (tx, ty) => Math.hypot(Math.max(tx - fx, 0, fx - tx - 1), Math.max(ty - fy, 0, fy - ty - 1)) * tm;
+    const ring = Math.ceil(view / tm);
+    for (let dy = -ring; dy <= ring; dy++) {
+      for (let dx = -ring; dx <= ring; dx++) {
         const tx = ptx + dx, ty = pty + dy;
-        if (ty < 0 || ty >= N_TILES) continue;
+        if (ty < 0 || ty >= N_TILES || dist(tx, ty) > view) continue;
         const key = `${tx}/${ty}`;
         if (this.tiles.has(key)) continue;
-        const t = { key, tx, ty, data: null, group: null, failed: false, gen: this.gen };
+        const t = { key, tx, ty, data: null, group: null, chunks: null, failed: false, gen: this.gen };
         this.placeTile(t);
         this.tiles.set(key, t);
         this.queue.push(t);
       }
     }
     for (const t of this.tiles.values()) {
-      const ring = Math.max(Math.abs(t.tx - ptx), Math.abs(t.ty - pty));
-      if (ring > KEEP_RING) {
+      if (dist(t.tx, t.ty) > view + KEEP_MARGIN) {
         this.disposeTile(t);
         this.tiles.delete(t.key);
-      } else if (t.group) {
-        t.group.visible = ring <= LOAD_RING; // farther tiles are fully hidden by fog
       }
     }
+    this.cullTimer += dt;
+    if (this.cullTimer > 0.25) {
+      this.cullTimer = 0;
+      this.cull(x, z);
+    }
     this.pump();
+  }
+
+  // Hide everything beyond the view distance, and fine detail (road paint, plants) sooner than that.
+  cull(x, z) {
+    const q = this.q, tm = this.tileMeters;
+    for (const t of this.tiles.values()) {
+      if (!t.group) continue;
+      const lx = x - t.wx, lz = z - t.wz;
+      t.group.visible = Math.hypot(Math.max(-lx, 0, lx - tm), Math.max(-lz, 0, lz - tm)) < q.view;
+      if (!t.group.visible) continue;
+      for (const c of t.chunks) {
+        const d = Math.hypot(Math.max(c.x0 - lx, 0, lx - c.x1), Math.max(c.z0 - lz, 0, lz - c.z1));
+        c.group.visible = d < q.view;
+        if (!c.group.visible) continue;
+        if (c.marks) c.marks.visible = d < q.marks;
+        if (c.trees) {
+          c.trees.visible = d < q.trees;
+          c.trees.count = Math.max(1, Math.ceil(c.treeN * q.treeDensity * (d > q.trees * 0.5 ? 0.6 : 1)));
+        }
+        if (c.bushes) {
+          c.bushes.visible = d < q.trees * 0.6;
+          c.bushes.count = Math.max(1, Math.ceil(c.bushN * q.treeDensity));
+        }
+      }
+    }
   }
 
   pump() {
@@ -267,6 +345,7 @@ export class World {
       w.busy = true;
       w.postMessage({
         id, tx: t.tx, ty: t.ty, tileMeters: this.tileMeters, infill: this.infill,
+        treeBudget: this.q.treeBudget, bushBudget: this.q.bushBudget,
         url: this.urlTemplate.replace('{z}', Z).replace('{x}', wrapped).replace('{y}', t.ty),
       });
     }
@@ -290,57 +369,79 @@ export class World {
     if (t.group) t.group.position.set(t.wx, 0, t.wz);
   }
 
+  // Turn worker output into meshes. Each tile is CHUNKS x CHUNKS blocks; every block gets its own
+  // small meshes (sharing the tile's vertex buffers) so that distant blocks cost nothing to draw.
   buildTile(t, d) {
     const group = new THREE.Group();
-    const mesh = (part, mat, attrs, order) => {
-      if (!part.index.length) return;
-      const g = new THREE.BufferGeometry();
-      for (const [name, size] of attrs) g.setAttribute(name, new THREE.BufferAttribute(part[name], size));
-      g.setIndex(new THREE.BufferAttribute(part.index, 1));
+    const pc = [['position', 3], ['color', 3]];
+    const wallAttrs = [['position', 3], ['normal', 3], ['uv', 2], ['color', 3], ['layer', 1]];
+    const buffers = (part, attrs) => ({
+      attrs: attrs.map(([name, size]) => [name, new THREE.BufferAttribute(part[name], size)]),
+      index: new THREE.BufferAttribute(part.index, 1),
+    });
+
+    // ground: one mesh per tile, drawn in the order it was generated
+    {
+      const g = new THREE.BufferGeometry(), b = buffers(d.land, pc);
+      for (const [name, attr] of b.attrs) g.setAttribute(name, attr);
+      g.setIndex(b.index);
       g.computeBoundingSphere();
-      const m = new THREE.Mesh(g, mat);
-      m.renderOrder = order;
+      const m = new THREE.Mesh(g, this.mat.land);
+      m.renderOrder = -20;
       m.matrixAutoUpdate = false;
       group.add(m);
-    };
-    const pc = [['position', 3], ['color', 3]];
-    mesh(d.land, this.mat.land, pc, -20);
-    mesh(d.roads, this.mat.roads, pc, -10);
-    d.walls.forEach((w, i) => mesh(w, this.mat.walls[i], [['position', 3], ['normal', 3], ['uv', 2], ['color', 3]], 0));
-    mesh(d.roofs, this.mat.roofs, pc, 0);
-
-    const n = d.trees.length / TREE_STRIDE;
-    if (n) {
-      const trees = new THREE.InstancedMesh(this.treeGeo, this.mat.tree, n);
-      const m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), s = new THREE.Vector3();
-      const up = new THREE.Vector3(0, 1, 0), col = new THREE.Color();
-      for (let i = 0; i < n; i++) {
-        const o = i * TREE_STRIDE;
-        const sc = d.trees[o + 2] * 4.2, tint = d.trees[o + 3];
-        q.setFromAxisAngle(up, tint * 6.283);
-        m.compose(p.set(d.trees[o], 0, d.trees[o + 1]), q, s.set(sc, sc * (0.85 + tint * 0.4), sc));
-        trees.setMatrixAt(i, m);
-        trees.setColorAt(i, col.setHSL(0.26 + tint * 0.1, 0.45 + tint * 0.2, 0.3 + tint * 0.12));
-      }
-      trees.computeBoundingSphere();
-      group.add(trees);
     }
 
-    const nb = d.bushes.length / TREE_STRIDE;
-    if (nb) {
-      const bushes = new THREE.InstancedMesh(this.bushGeo, this.mat.tree, nb);
-      const m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), s = new THREE.Vector3();
-      const up = new THREE.Vector3(0, 1, 0), col = new THREE.Color();
-      for (let i = 0; i < nb; i++) {
-        const o = i * TREE_STRIDE;
-        const sc = d.bushes[o + 2] * 1.9, tint = d.bushes[o + 3];
-        q.setFromAxisAngle(up, tint * 6.283);
-        m.compose(p.set(d.bushes[o], 0, d.bushes[o + 1]), q, s.set(sc, sc * (0.8 + tint * 0.5), sc));
-        bushes.setMatrixAt(i, m);
-        bushes.setColorAt(i, col.setHSL(0.24 + tint * 0.1, 0.4 + tint * 0.2, 0.22 + tint * 0.1));
-      }
-      bushes.computeBoundingSphere();
-      group.add(bushes);
+    // [data, material, attributes, draw order, tag]
+    const parts = [
+      [d.casing, this.mat.roads, pc, -12],
+      [d.minorRoads, this.mat.roads, pc, -11],
+      [d.majorRoads, this.mat.roads, pc, -10],
+      [d.marks, this.mat.roads, pc, -9, 'marks'],
+      [d.buildings, this.mat.buildings, wallAttrs, 0],
+    ];
+    const shared = parts.map(([part, , attrs]) => (part.index.length ? buffers(part, attrs) : null));
+    const cs = this.tileMeters / CHUNKS;
+    const plants = (inst, geo, c, cx, cz) => {
+      const s = inst.ranges[c * 2], n = inst.ranges[c * 2 + 1];
+      if (!n) return null;
+      const m = new THREE.InstancedMesh(geo, this.mat.tree, 0);
+      m.instanceMatrix = new THREE.InstancedBufferAttribute(inst.matrix.subarray(s * 16, (s + n) * 16), 16);
+      m.instanceColor = new THREE.InstancedBufferAttribute(inst.color.subarray(s * 3, (s + n) * 3), 3);
+      m.count = n;
+      m.boundingSphere = new THREE.Sphere(new THREE.Vector3(cx, 6, cz), cs * 0.72 + 14);
+      m.matrixAutoUpdate = false;
+      return m;
+    };
+    t.chunks = [];
+    for (let c = 0; c < CHUNKS * CHUNKS; c++) {
+      const cg = new THREE.Group();
+      const x0 = (c % CHUNKS) * cs, z0 = Math.floor(c / CHUNKS) * cs;
+      const chunk = { group: cg, x0, z0, x1: x0 + cs, z1: z0 + cs, marks: null, trees: null, treeN: 0, bushes: null, bushN: 0 };
+      parts.forEach(([part, mat, , order, tag], pi) => {
+        const count = part.index.length ? part.ranges[c * 2 + 1] : 0;
+        if (!count) return;
+        const g = new THREE.BufferGeometry();
+        for (const [name, attr] of shared[pi].attrs) g.setAttribute(name, attr);
+        g.setIndex(shared[pi].index);
+        g.setDrawRange(part.ranges[c * 2], count);
+        const b = part.bounds, o = c * 6;
+        g.boundingSphere = new THREE.Sphere(
+          new THREE.Vector3((b[o] + b[o + 3]) / 2, (b[o + 1] + b[o + 4]) / 2, (b[o + 2] + b[o + 5]) / 2),
+          Math.hypot(b[o + 3] - b[o], b[o + 4] - b[o + 1], b[o + 5] - b[o + 2]) / 2,
+        );
+        const m = new THREE.Mesh(g, mat);
+        m.renderOrder = order;
+        m.matrixAutoUpdate = false;
+        cg.add(m);
+        if (tag) chunk[tag] = m;
+      });
+      chunk.trees = plants(d.trees, this.treeGeo, c, x0 + cs / 2, z0 + cs / 2);
+      chunk.bushes = plants(d.bushes, this.bushGeo, c, x0 + cs / 2, z0 + cs / 2);
+      if (chunk.trees) { chunk.treeN = chunk.trees.count; cg.add(chunk.trees); }
+      if (chunk.bushes) { chunk.bushN = chunk.bushes.count; cg.add(chunk.bushes); }
+      if (cg.children.length) group.add(cg);
+      t.chunks.push(chunk);
     }
 
     group.position.set(t.wx, 0, t.wz);
@@ -349,6 +450,7 @@ export class World {
     t.group = group;
     t.data = d;
     t.segStamp = new Uint32Array(d.segs.length / SEG_STRIDE);
+    this.cullTimer = 99;
   }
 
   disposeTile(t) {
@@ -359,6 +461,7 @@ export class World {
       else if (o.geometry) o.geometry.dispose();
     });
     t.group = null;
+    t.chunks = null;
     t.data = null;
   }
 
@@ -433,7 +536,7 @@ export class World {
       if (!t.data) continue;
       const segs = t.data.segs, lx = x - t.wx, lz = z - t.wz;
       for (let o = 0; o < segs.length; o += SEG_STRIDE) {
-        if (segs[o + 5] !== KIND_ROAD || segs[o + 4] < 1.5) continue;
+        if (segs[o + 5] !== KIND_ROAD || segs[o + 4] < 1.2) continue;
         const ax = segs[o], az = segs[o + 1], dx = segs[o + 2] - ax, dz = segs[o + 3] - az;
         const l2 = dx * dx + dz * dz;
         if (l2 < 1) continue;

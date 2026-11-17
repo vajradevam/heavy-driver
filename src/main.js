@@ -33,12 +33,24 @@ const me = {
 
 // ------------------------------------------------------------ scene
 const SKY = 0xa9cdea;
-const renderer = new THREE.WebGLRenderer({ canvas: $('view'), antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+// ------------------------------------------------------------ quality
+// view: how far the world is drawn (m). marks / trees: how far road paint and plants are drawn.
+// scale x min(devicePixelRatio, maxPR) is the rendering resolution relative to the window.
+const QUALITY = {
+  low: { view: 650, fogNear: 150, marks: 200, trees: 330, treeDensity: 0.45, treeBudget: 5000, bushBudget: 0, signs: 30, signRange: 0.6, scale: 0.7, maxPR: 1, spot: false, hud: 0.4 },
+  medium: { view: 1300, fogNear: 320, marks: 450, trees: 750, treeDensity: 0.75, treeBudget: 9000, bushBudget: 2500, signs: 70, signRange: 0.85, scale: 1, maxPR: 1.5, spot: true, hud: 0.25 },
+  high: { view: 2300, fogNear: 500, marks: 1300, trees: 2300, treeDensity: 1, treeBudget: 12000, bushBudget: 5000, signs: 120, signRange: 1, scale: 1, maxPR: 2, spot: true, hud: 0.2 },
+};
+let qualityMode = ['auto', 'low', 'medium', 'high'].includes(saved.quality) ? saved.quality : 'auto';
+let tier = qualityMode === 'auto' ? 'medium' : qualityMode;
+let resScale = qualityMode === 'auto' ? 0.7 : 1; // auto mode moves this between 0.5 and 1 to hold the frame rate
+
+// Antialiasing can only be chosen when the renderer is created, so it follows the saved setting.
+const renderer = new THREE.WebGLRenderer({ canvas: $('view'), antialias: qualityMode === 'high', powerPreference: 'high-performance' });
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(SKY);
 scene.fog = new THREE.Fog(SKY, 500, 2300);
-const camera = new THREE.PerspectiveCamera(60, 1, 0.5, 6000);
+const camera = new THREE.PerspectiveCamera(60, 1, 0.5, 2600);
 const hemi = new THREE.HemisphereLight(0xffffff, 0x8c8676, 1.5);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff2dc, 2.0);
@@ -46,6 +58,8 @@ sun.position.set(-0.5, 1, 0.35);
 scene.add(sun);
 
 function resize() {
+  const q = QUALITY[tier];
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, q.maxPR) * q.scale * resScale);
   renderer.setSize(window.innerWidth, window.innerHeight, false);
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
@@ -63,12 +77,43 @@ scene.add(carModel);
 
 const sky = new DayNight({
   scene, hemi, sun,
-  flat: [world.mat.land, world.mat.roads, world.mat.roofs],
-  walls: world.mat.walls,
-  onChange: (night) => { setCarNight(night); signs.setNight(night); headlight.intensity = night * 70; },
+  flat: [world.mat.land, world.mat.roads],
+  walls: [world.mat.buildings],
+  onChange: (night) => { setCarNight(night); signs.setNight(night); headlight.intensity = night * 70; headlight.visible = QUALITY[tier].spot && night > 0.03; },
 });
 sky.mode = saved.timeMode || 'real';
 let skyTimer = 99;
+
+function applyQuality() {
+  const q = QUALITY[tier];
+  world.setQuality(q);
+  signs.setLimits(q.signs, q.signRange);
+  scene.fog.near = q.fogNear;
+  scene.fog.far = q.view;
+  camera.far = q.view + 150;
+  skyTimer = 99; // re-applies the headlight setting
+  resize();
+}
+applyQuality();
+
+// Auto mode: hold a playable frame rate by lowering the rendering resolution first,
+// then dropping to the low preset if that is not enough.
+let fps = 60, govTimer = 0;
+function govern(dt) {
+  if (dt > 0 && dt < 0.5) fps += (1 / dt - fps) * 0.05;
+  govTimer += dt;
+  if (govTimer < 1.5) return;
+  govTimer = 0;
+  if (qualityMode !== 'auto' || world.pending || document.hidden) return;
+  if (fps < 27) {
+    const floor = tier === 'low' ? 0.75 : 0.5; // never go blurrier than about half resolution
+    if (resScale > floor) { resScale = Math.max(floor, resScale - 0.1); resize(); }
+    else if (tier !== 'low') { tier = 'low'; resScale = 0.8; applyQuality(); flash('Switched to low detail to keep the game smooth'); }
+  } else if (fps > 52 && resScale < 1) {
+    resScale = Math.min(1, resScale + 0.05);
+    resize();
+  }
+}
 let needSnap = true;
 
 function teleport(lon, lat) {
@@ -148,6 +193,15 @@ function updateCamera(dt) {
 $('name').value = me.name;
 $('color').value = `#${me.color.toString(16).padStart(6, '0')}`;
 $('infill').checked = world.infill;
+$('quality').value = qualityMode;
+$('quality').addEventListener('change', (e) => {
+  qualityMode = e.target.value;
+  tier = qualityMode === 'auto' ? 'medium' : qualityMode;
+  resScale = qualityMode === 'auto' ? 0.7 : 1;
+  store.save({ quality: qualityMode });
+  applyQuality();
+  e.target.blur();
+});
 $('timeMode').value = sky.mode;
 $('timeMode').addEventListener('change', (e) => { sky.mode = e.target.value; store.save({ timeMode: sky.mode }); skyTimer = 99; e.target.blur(); });
 $('name').addEventListener('input', (e) => { me.name = e.target.value.trim().slice(0, 20) || 'Driver'; store.save({ name: me.name }); });
@@ -322,7 +376,7 @@ function updateHud() {
   $('road').textContent = world.nameAt(car.x, car.z);
   const [hudLon, hudLat] = world.toLonLat(car.x, car.z);
   const clock = localClock(new Date(), hudLat, hudLon);
-  $('coords').textContent = `${hudLat.toFixed(5)}, ${hudLon.toFixed(5)} · ${clock.time} ${clock.zone}`;
+  $('coords').textContent = `${hudLat.toFixed(5)}, ${hudLon.toFixed(5)} · ${clock.time} ${clock.zone} · ${Math.round(fps)} fps`;
   let text = '';
   if (performance.now() < flashUntil) text = flashText;
   else if (fatal) text = fatal;
@@ -330,13 +384,14 @@ function updateHud() {
   else if (world.lastError && !world.stats().tiles) text = `Map data failed to load (${world.lastError})`;
   $('status').textContent = text;
   $('status').style.display = text ? 'block' : 'none';
-  updatePlayers();
+  if (net.peers.size || shownPeers) updatePlayers();
+  shownPeers = net.peers.size;
   drawMinimap();
 }
 
 // ------------------------------------------------------------ main loop
 let fatal = '';
-let last = performance.now(), hudTimer = 0, saveTimer = 0;
+let last = performance.now(), hudTimer = 0, saveTimer = 0, shownPeers = -1;
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
@@ -363,7 +418,8 @@ function frame(now) {
     car.x = 0; car.z = 0;
   }
 
-  world.update(car.x, car.z);
+  world.update(car.x, car.z, dt);
+  govern(dt);
   poseCar(carModel, car.x, car.z, car.heading, car.steer, car.speed, dt);
   net.update(dt, { x: car.x, z: car.z, heading: car.heading, speed: car.speed, steer: car.steer, name: me.name, color: me.color });
   signs.update(dt, car.x, car.z);
@@ -376,7 +432,7 @@ function frame(now) {
   updateCamera(dt);
 
   hudTimer += dt;
-  if (hudTimer > 0.2) { hudTimer = 0; updateHud(); }
+  if (hudTimer > QUALITY[tier].hud) { hudTimer = 0; updateHud(); }
   saveTimer += dt;
   if (saveTimer > 5 && !needSnap) {
     saveTimer = 0;
@@ -396,4 +452,4 @@ world.init().catch((err) => { fatal = `Could not reach the map server: ${err.mes
 requestAnimationFrame(frame);
 
 // Handy for debugging from the browser console.
-window.__game = { world, car, net, signs, sky, teleport, scene, camera, renderer };
+window.__game = { world, car, net, signs, sky, teleport, quality: () => ({ mode: qualityMode, tier, resScale, fps }), scene, camera, renderer };
