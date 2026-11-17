@@ -1,0 +1,50 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; overflow: hidden; background: #9fc4e4; font: 14px/1.4 system-ui, sans-serif; color: #eef1f5; }
+#view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+
+.box { background: rgba(16, 20, 27, 0.82); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; backdrop-filter: blur(6px); }
+#panel { position: fixed; top: 12px; left: 12px; width: 270px; max-width: calc(100vw - 24px); padding: 10px 12px; max-height: calc(100vh - 24px); overflow-y: auto; }
+#panel.collapsed #panelBody { display: none; }
+#panel.collapsed { width: auto; }
+.row { display: flex; gap: 6px; align-items: center; margin: 6px 0; }
+.row.head { justify-content: space-between; margin-top: 0; }
+.sep { height: 1px; background: rgba(255, 255, 255, 0.12); margin: 10px 0; }
+.dim { color: #9aa5b4; font-size: 12px; }
+.keys { margin-top: 6px; }
+.check { font-size: 12px; cursor: pointer; }
+
+input[type='text'], select { flex: 1; min-width: 0; padding: 6px 8px; border-radius: 6px; border: 1px solid #3a4352; background: #1c222c; color: inherit; font: inherit; }
+input[type='color'] { width: 34px; height: 30px; padding: 0; border: 1px solid #3a4352; border-radius: 6px; background: none; }
+button { padding: 6px 10px; border-radius: 6px; border: 1px solid #3a4352; background: #2a3342; color: inherit; font: inherit; cursor: pointer; white-space: nowrap; }
+button:hover { background: #364258; }
+button.wide { flex: 1; }
+#togglePanel { padding: 0 8px; line-height: 20px; }
+
+#results { display: flex; flex-direction: column; gap: 2px; }
+#results button { text-align: left; white-space: normal; font-size: 12px; background: #1c222c; }
+#players .player { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 13px; }
+#players .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+#players .who { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#players .arrow { display: inline-block; width: 14px; text-align: center; }
+#players button { padding: 2px 8px; font-size: 12px; }
+
+#minimap { position: fixed; top: 12px; right: 12px; width: 200px; height: 200px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, 0.35); background: #20262f; }
+#hud { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); text-align: center; pointer-events: none; text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8); }
+#road { font-size: 16px; font-weight: 600; min-height: 22px; }
+#speed { font-size: 15px; }
+#kmh { font-size: 40px; font-weight: 700; font-variant-numeric: tabular-nums; }
+#status { position: fixed; left: 50%; top: 14px; transform: translateX(-50%); padding: 6px 12px; font-size: 13px; display: none; max-width: 60vw; text-align: center; }
+#credit { position: fixed; right: 8px; bottom: 6px; font-size: 11px; color: #1c222c; background: rgba(255, 255, 255, 0.7); padding: 2px 6px; border-radius: 4px; }
+#credit a { color: inherit; }
+
+#touch { display: none; }
+@media (pointer: coarse) {
+  #touch { display: block; }
+  #touch .pad { position: fixed; bottom: 70px; display: flex; gap: 10px; }
+  #touch .left { left: 14px; }
+  #touch .right { right: 14px; }
+  #touch button { width: 76px; height: 76px; border-radius: 50%; font-size: 16px; background: rgba(16, 20, 27, 0.6); user-select: none; -webkit-user-select: none; touch-action: none; }
+  #minimap { width: 120px; height: 120px; }
+  .keys { display: none; }
+}
+#coords { font-size: 12px; opacity: 0.85; font-variant-numeric: tabular-nums; }
